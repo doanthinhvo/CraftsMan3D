@@ -38,7 +38,7 @@ system:
 
   shape_model_type: michelangelo-autoencoder
   shape_model:
-    pretrained_model_name_or_path: ckpts/model.ckpt
+    pretrained_model_name_or_path: ckpts/craftsman/model.ckpt
     use_downsample: true
     num_latents: 768
     use_multi_reso: false
