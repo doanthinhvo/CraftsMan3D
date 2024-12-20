@@ -31,3 +31,8 @@ Each point has 6 features:
 - Statistical measures:
   - Mean: -0.008 (approximate)
   - Standard deviation: 0.534 (approximate)
+
+### Visualization Example
+<p align="center">
+  <img src="asset/surface_data_visualize.png" alt="Surface data visualization example">
+</p>

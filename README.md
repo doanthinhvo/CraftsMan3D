@@ -188,7 +188,11 @@ Q: Tips to get better results.
 - [x] Gradio & Hugging Face demo
 - [x] Model zoo, we will release more ckpt in the future
 - [x] Environment setup
-- [x] Data sample
+- [x] Data sample 
+- [x] Data sample ver 1.5
+- [x] Details of data format
+- [ ] Code for data processing from obj, glb, fbx
+- [x] LoRA fine-tuning code
 - [ ] Code for mesh refine
 
 
