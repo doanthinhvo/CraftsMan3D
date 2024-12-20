@@ -159,9 +159,12 @@ python train.py --config ./configs/shape-autoencoder/michelangelo-l768-e64-ne8-n
                  --train --gpu 0
 
 ### training the image-to-shape diffusion model
-python train.py --config .configs/image-to-shape-diffusion/clip-dino-rgb-pixart-lr2e4-ddim.yaml \
+python train.py --config ./configs/image-to-shape-diffusion/clip-dino-rgb-pixart-lr2e4-ddim.yaml \
                  --train --gpu 0
 
+### training the image-to-shape diffusion model with LoRA
+python train_lora.py --config ./configs/image-to-shape-diffusion/clip-dino-rgb-pixart-lr2e4-ddim.yaml \
+                 --train --gpu 0
 ```
 
 # 2D Normal Enhancement Diffusion Model (TBA)
