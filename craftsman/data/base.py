@@ -48,6 +48,7 @@ class BaseDataModuleConfig:
 
     ################################# Geometry part #################################
     load_geometry: bool = True           # whether to load geometry data
+    data_type: str = "occupancy"        # occupancy, sdf, dual_sdf
     geo_data_type: str = "occupancy"     # occupancy, sdf
     geo_data_path: str = ""              # path to the geometry data
     # for occupancy and sdf data
@@ -88,17 +89,37 @@ class BaseDataset(Dataset):
 
 
     def _load_shape_from_occupancy_or_sdf(self, index: int) -> Dict[str, Any]:
-        if self.cfg.geo_data_type == "occupancy":
-            # for input point cloud, using Objaverse-MIX data
+        """
+        Load input data, which contains point cloud and normal
+        """
+        if self.cfg.geo_data_type == "occupancy": # For using Objaverse-MIX data
             pointcloud = np.load(f'{self.cfg.geo_data_path}/{self.uids[index]}/pointcloud.npz')
+            # Log successful loading of pointcloud data
+            with open('data_loading.log', 'a') as f:
+                f.write(f"Successfully loaded pointcloud data for {self.uids[index]}\n")
             surface = np.asarray(pointcloud['points']) * 2 # range from -1 to 1
             normal = np.asarray(pointcloud['normals'])
             surface = np.concatenate([surface, normal], axis=1)
         elif self.cfg.geo_data_type == "sdf":
             # for sdf data with our own format
             data = np.load(f'{self.cfg.geo_data_path}/{self.uids[index]}.npz')
+            with open('log/data_loading.log', 'a') as f:
+                f.write(f"Successfully loaded sdf data for {self.uids[index]}\n")
             # for input point cloud
             surface = data["surface"]
+
+        elif self.cfg.geo_data_type == "dual_sdf":
+            data = np.load(f'{self.cfg.geo_data_path}/{self.uids[index]}/pointcloud.npz')
+            with open('log/data_loading.log', 'a') as f:
+                f.write(f"Successfully loaded sdf data for {self.uids[index]}\n")
+            # for input point cloud
+            
+            salient_points = data["salient_points"]
+            salient_normals = data["salient_normals"]
+            uniform_points = data["uniform_points"]
+            uniform_normals = data["uniform_normals"]
+            surface = np.concatenate([uniform_points, uniform_normals, salient_points, salient_normals], axis=1)
+            # surface  (n, 12)
         else:
             raise NotImplementedError(f"Data type {self.cfg.geo_data_type} not implemented")
         
@@ -204,7 +225,7 @@ class BaseDataset(Dataset):
         ret = {"uid": self.uids[index]}
         # load geometry
         if self.cfg.load_geometry:
-            if self.cfg.geo_data_type == "occupancy" or self.cfg.geo_data_type == "sdf":
+            if self.cfg.geo_data_type == "occupancy" or self.cfg.geo_data_type == "sdf" or self.cfg.geo_data_type == "dual_sdf":
                 # load shape
                 ret = self._load_shape_from_occupancy_or_sdf(index)
                 # load supervision for shape

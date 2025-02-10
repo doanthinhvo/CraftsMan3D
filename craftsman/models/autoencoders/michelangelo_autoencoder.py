@@ -6,7 +6,7 @@ import numpy as np
 import random
 import torch.nn as nn
 from einops import repeat, rearrange
-
+from torch_cluster import fps
 import craftsman
 from craftsman.models.transformers.perceiver_1d import Perceiver
 from craftsman.models.transformers.attention import ResidualCrossAttentionBlock
@@ -21,11 +21,11 @@ VALID_EMBED_TYPES = ["identity", "fourier", "learned_fourier", "siren"]
 
 class FourierEmbedder(nn.Module):
     def __init__(self,
-                 num_freqs: int = 6,
-                 logspace: bool = True,
-                 input_dim: int = 3,
-                 include_input: bool = True,
-                 include_pi: bool = True) -> None:
+                num_freqs: int = 6,
+                logspace: bool = True,
+                input_dim: int = 3,
+                include_input: bool = True,
+                include_pi: bool = True) -> None:
         super().__init__()
 
         if logspace:
@@ -188,7 +188,11 @@ class AutoEncoder(BaseModule):
                 surface: torch.FloatTensor,
                 queries: torch.FloatTensor,
                 sample_posterior: bool = True):
-        shape_latents, kl_embed, posterior = self.encode(surface, sample_posterior=sample_posterior)
+        
+        if self.cfg.encoder == "perceiver-dual-cross-attention-encoder":
+            shape_latents, kl_embed, posterior = self.encode_dual(surface, sample_posterior=sample_posterior)
+        else:
+            shape_latents, kl_embed, posterior = self.encode(surface, sample_posterior=sample_posterior)
 
         latents = self.decode(kl_embed) # [B, num_latents, width]
 
@@ -363,6 +367,9 @@ class PerceiverCrossAttentionEncoder(nn.Module):
             use_flash=use_flash,
         )
 
+        # TODO: add self.cross_attn2
+
+
         self.self_attn = Perceiver(
             n_ctx=num_latents,
             width=width,
@@ -436,7 +443,9 @@ class PerceiverCrossAttentionEncoder(nn.Module):
             query = self.query
             query = repeat(query, "m c -> b m c", b=bs)
 
+        breakpoint()
         latents = self.cross_attn(query, data)
+        # latents2 = self.cross_attn2(query, data)
         latents = self.self_attn(latents)
 
         if self.ln_post is not None:
@@ -456,6 +465,155 @@ class PerceiverCrossAttentionEncoder(nn.Module):
         """
 
         return checkpoint(self._forward, (pc, feats), self.parameters(), self.use_checkpoint)
+
+class PerceiverDualCrossAttentionEncoder(nn.Module):
+    def __init__(self,
+                 use_downsample: bool,
+                 num_latents: int,
+                 embedder: FourierEmbedder,
+                 point_feats: int,
+                 embed_point_feats: bool,
+                 width: int,
+                 heads: int,
+                 layers: int,
+                 init_scale: float = 0.25,
+                 qkv_bias: bool = True,
+                 use_ln_post: bool = False,
+                 use_flash: bool = False,
+                 use_checkpoint: bool = False,
+                 use_multi_reso: bool = False,
+                 resolutions: list = [],
+                 sampling_prob: list = []):
+
+        super().__init__()
+
+        self.use_checkpoint = use_checkpoint
+        self.num_latents = num_latents
+        self.use_downsample = use_downsample
+        self.embed_point_feats = embed_point_feats
+        self.use_multi_reso = use_multi_reso
+        self.resolutions = resolutions
+        self.sampling_prob = sampling_prob
+
+        if not self.use_downsample:
+            self.query = nn.Parameter(torch.randn((num_latents, width)) * 0.02)
+
+        self.embedder = embedder
+        if self.embed_point_feats:
+            self.input_proj = nn.Linear(self.embedder.out_dim * 2, width)
+        else:
+            self.input_proj = nn.Linear(self.embedder.out_dim + point_feats, width)
+
+        self.cross_attn = ResidualCrossAttentionBlock(
+            width=width,
+            heads=heads,
+            init_scale=init_scale,
+            qkv_bias=qkv_bias,
+            use_flash=use_flash,
+        )
+
+        self.self_attn = Perceiver(
+            n_ctx=num_latents,
+            width=width,
+            layers=layers,
+            heads=heads,
+            init_scale=init_scale,
+            qkv_bias=qkv_bias,
+            use_flash=use_flash,
+            use_checkpoint=False
+        )
+
+        if use_ln_post:
+            self.ln_post = nn.LayerNorm(width)
+        else:
+            self.ln_post = None
+
+    def _forward(self, uniform_pc, salient_pc, uniform_feats, salient_feats):
+        """
+
+        Args:
+            uniform_pc (torch.FloatTensor): [B, N, 3]
+            salient_pc (torch.FloatTensor): [B, N, 3]
+            uniform_feats (torch.FloatTensor or None): [B, N, C]
+            salient_feats (torch.FloatTensor or None): [B, N, C]
+
+        Returns:
+
+        """
+
+        bs, N, D = uniform_pc.shape
+        
+        uniform_data = self.embedder(uniform_pc)
+        if uniform_feats is not None:
+            if self.embed_point_feats:
+                uniform_feats = self.embedder(uniform_feats)
+            uniform_data = torch.cat([uniform_data, uniform_feats], dim=-1)
+        uniform_data = self.input_proj(uniform_data)
+
+        salient_data = self.embedder(salient_pc)
+        if salient_feats is not None:
+            if self.embed_point_feats:
+                salient_feats = self.embedder(salient_feats)
+            salient_data = torch.cat([salient_data, salient_feats], dim=-1)
+        salient_data = self.input_proj(salient_data)
+
+        if self.use_downsample:
+            ###### fps
+            from torch_cluster import fps
+            uniform_flattened = uniform_pc.view(bs*N, D) # bs*N, 64
+            salient_flattened = salient_pc.view(bs*N, D) # bs*N, 64
+
+            uniform_batch = torch.arange(bs).to(uniform_pc.device)
+            uniform_batch = torch.repeat_interleave(uniform_batch, N) # bs*N
+            salient_batch = torch.arange(bs).to(salient_pc.device)
+            salient_batch = torch.repeat_interleave(salient_batch, N) # bs*N
+
+            uniform_pos = uniform_flattened
+            salient_pos = salient_flattened
+
+            uniform_ratio = 0.5 * self.num_latents / N # 0.5 for half of the points 
+            salient_ratio = 0.5 * self.num_latents / N
+
+            uniform_idx = fps(uniform_pos, uniform_batch, ratio=uniform_ratio)
+            salient_idx = fps(salient_pos, salient_batch, ratio=salient_ratio)
+
+            uniform_query = uniform_data.view(bs*N, -1)[uniform_idx].view(bs, -1, uniform_data.shape[-1]) # from uniform_data torch.Size([1, 16384, 768]) to uniform_query torch.Size([1, 384, 768])
+            salient_query = salient_data.view(bs*N, -1)[salient_idx].view(bs, -1, salient_data.shape[-1]) # from salient_data torch.Size([1, 16384, 768]) to salient_query torch.Size([1, 384, 768])
+        else:
+            uniform_query = self.query
+            uniform_query = repeat(uniform_query, "m c -> b m c", b=bs)
+            salient_query = self.query
+            salient_query = repeat(salient_query, "m c -> b m c", b=bs)
+
+        breakpoint()
+        # Combine uniform and salient queries
+        query = torch.cat([uniform_query, salient_query], dim=1) # B, num_latents, width
+        
+        uniform_latents = self.cross_attn(query, uniform_data)
+        salient_latents = self.cross_attn(query, salient_data)
+
+        latents = uniform_latents + salient_latents
+        latents = self.self_attn(latents)
+
+        if self.ln_post is not None:
+            latents = self.ln_post(latents)
+
+        return latents
+
+    def forward(self, uniform_pc: torch.FloatTensor, salient_pc: torch.FloatTensor, uniform_feats: Optional[torch.FloatTensor] = None, salient_feats: Optional[torch.FloatTensor] = None):
+        """
+
+        Args:
+            uniform_pc (torch.FloatTensor): [B, N, 3]
+            salient_pc (torch.FloatTensor): [B, N, 3]
+            uniform_feats (torch.FloatTensor or None): [B, N, C]
+            salient_feats (torch.FloatTensor or None): [B, N, C]
+
+        Returns:
+            dict
+        """
+
+        return checkpoint(self._forward, (uniform_pc, salient_pc, uniform_feats, salient_feats), self.parameters(), self.use_checkpoint)
 
 
 class PerceiverCrossAttentionDecoder(nn.Module):
@@ -533,6 +691,7 @@ class MichelangeloAutoencoder(AutoEncoder):
         use_multi_reso: Optional[bool] = False
         resolutions: Optional[List[int]] = None
         sampling_prob: Optional[List[float]] = None
+        encoder: str = "perceiver-cross-attention-encoder"
 
     cfg: Config
 
@@ -543,24 +702,45 @@ class MichelangeloAutoencoder(AutoEncoder):
 
         # encoder
         self.cfg.init_scale = self.cfg.init_scale * math.sqrt(1.0 / self.cfg.width)
-        self.encoder = PerceiverCrossAttentionEncoder(
-            use_downsample=self.cfg.use_downsample,
-            embedder=self.embedder,
-            num_latents=self.cfg.num_latents,
-            point_feats=self.cfg.point_feats,
-            embed_point_feats=self.cfg.embed_point_feats,
-            width=self.cfg.width,
-            heads=self.cfg.heads,
-            layers=self.cfg.num_encoder_layers,
-            init_scale=self.cfg.init_scale,
-            qkv_bias=self.cfg.qkv_bias,
-            use_ln_post=self.cfg.use_ln_post,
-            use_flash=self.cfg.use_flash,
-            use_checkpoint=self.cfg.use_checkpoint,
-            use_multi_reso=self.cfg.use_multi_reso,
-            resolutions=self.cfg.resolutions,
-            sampling_prob=self.cfg.sampling_prob
-        )
+
+        if self.cfg.encoder == "perceiver-dual-cross-attention-encoder":    
+            self.encoder = PerceiverDualCrossAttentionEncoder(
+                use_downsample=self.cfg.use_downsample,
+                embedder=self.embedder,
+                num_latents=self.cfg.num_latents,
+                point_feats=self.cfg.point_feats,
+                embed_point_feats=self.cfg.embed_point_feats,
+                width=self.cfg.width,
+                heads=self.cfg.heads,
+                layers=self.cfg.num_encoder_layers,
+                init_scale=self.cfg.init_scale,
+                qkv_bias=self.cfg.qkv_bias,
+                use_ln_post=self.cfg.use_ln_post,
+                use_flash=self.cfg.use_flash,
+                use_checkpoint=self.cfg.use_checkpoint,
+                use_multi_reso=self.cfg.use_multi_reso,
+                resolutions=self.cfg.resolutions,
+                sampling_prob=self.cfg.sampling_prob
+            )
+        else: 
+            self.encoder = PerceiverCrossAttentionEncoder(
+                use_downsample=self.cfg.use_downsample,
+                embedder=self.embedder,
+                num_latents=self.cfg.num_latents,
+                point_feats=self.cfg.point_feats,
+                embed_point_feats=self.cfg.embed_point_feats,
+                width=self.cfg.width,
+                heads=self.cfg.heads,
+                layers=self.cfg.num_encoder_layers,
+                init_scale=self.cfg.init_scale,
+                qkv_bias=self.cfg.qkv_bias,
+                use_ln_post=self.cfg.use_ln_post,
+                use_flash=self.cfg.use_flash,
+                use_checkpoint=self.cfg.use_checkpoint,
+                use_multi_reso=self.cfg.use_multi_reso,
+                resolutions=self.cfg.resolutions,
+                sampling_prob=self.cfg.sampling_prob
+            )
 
         if self.cfg.embed_dim > 0:
             # VAE embed
@@ -594,25 +774,37 @@ class MichelangeloAutoencoder(AutoEncoder):
             use_checkpoint=self.cfg.use_checkpoint
         )
 
+        
         if self.cfg.pretrained_model_name_or_path != "":
-            print(f"Loading pretrained model from {self.cfg.pretrained_model_name_or_path}")
+            print(f"Loading pretrained model from {self.cfg.pretrained_model_name_or_path} to michelangelo-autoencoder")
             pretrained_ckpt = torch.load(self.cfg.pretrained_model_name_or_path, map_location="cpu")
             if 'state_dict' in pretrained_ckpt:
                 _pretrained_ckpt = {}
                 for k, v in pretrained_ckpt['state_dict'].items():
                     if k.startswith('shape_model.'):
                         _pretrained_ckpt[k.replace('shape_model.', '')] = v
+                    
                 pretrained_ckpt = _pretrained_ckpt
             else:
                 _pretrained_ckpt = {}
                 for k, v in pretrained_ckpt.items():
                     if k.startswith('shape_model.'):
                         _pretrained_ckpt[k.replace('shape_model.', '')] = v
+                    else:
+                        _pretrained_ckpt[k] = v
                 pretrained_ckpt = _pretrained_ckpt
-                
+
             self.load_state_dict(pretrained_ckpt, strict=False)
+            # Currently initialize encoder exactly from pretrained model craftsMan-vae
             
-    
+            # if self.cfg.encoder == "perceiver-dual-cross-attention-encoder":
+            #     # Initialize dual_encoder weights from encoder weights
+            #     print("Initializing dual_encoder weights from encoder")
+            #     encoder_state = {k.replace('encoder.', 'dual_encoder.'): v 
+            #                     for k, v in self.state_dict().items() 
+            #                     if k.startswith('encoder.')}
+            #     self.load_state_dict(encoder_state, strict=False)
+            
     def encode(self,
                surface: torch.FloatTensor,
                sample_posterior: bool = True):
@@ -629,12 +821,10 @@ class MichelangeloAutoencoder(AutoEncoder):
         assert surface.shape[-1] == 3 + self.cfg.point_feats, f"\
             Expected {3 + self.cfg.point_feats} channels, got {surface.shape[-1]}"
         
+        breakpoint()
         pc, feats = surface[..., :3], surface[..., 3:] # B, n_samples, 3
         bs, N, D = pc.shape
         if N > self.cfg.n_samples:
-            # idx = furthest_point_sample(pc, self.cfg.n_samples) # (B, 3, npoint)
-            # pc = gather_operation(pc, idx).transpose(2, 1).contiguous()
-            # feats = gather_operation(feats, idx).transpose(2, 1).contiguous()
             from torch_cluster import fps
             flattened = pc.view(bs*N, D) # bs*N, 64
             batch = torch.arange(bs).to(pc.device)
@@ -650,6 +840,36 @@ class MichelangeloAutoencoder(AutoEncoder):
 
         return shape_latents, kl_embed, posterior
 
+    def encode_dual(self,
+                    surface: Dict[str, torch.FloatTensor],
+                    sample_posterior: bool = True):
+        uniform_pc, uniform_feats, salient_pc, salient_feats = surface[:,:,:3], surface[:,:,3:6], surface[:,:,6:9], surface[:,:,9:]
+        
+        
+        bs, N, D = uniform_pc.shape
+        if N > self.cfg.n_samples:
+            
+            uniform_flattened = uniform_pc.view(bs*N, D) # bs*N, 64
+            uniform_batch = torch.arange(bs).to(uniform_pc.device)
+            uniform_batch = torch.repeat_interleave(uniform_batch, N) # bs*N
+            uniform_pos = uniform_flattened
+            salient_flattened = salient_pc.view(bs*N, D) # bs*N, 64
+            salient_batch = torch.arange(bs).to(salient_pc.device)
+            salient_batch = torch.repeat_interleave(salient_batch, N) # bs*N
+            salient_pos = salient_flattened
+
+            uniform_ratio = self.cfg.n_samples / N 
+            uniform_idx = fps(uniform_pos, uniform_batch, ratio=uniform_ratio)
+            salient_ratio = self.cfg.n_samples / N 
+            salient_idx = fps(salient_pos, salient_batch, ratio=salient_ratio)
+            uniform_pc = uniform_pc.view(bs*N, -1)[uniform_idx].view(bs, -1, uniform_pc.shape[-1])
+            uniform_feats = uniform_feats.view(bs*N, -1)[uniform_idx].view(bs, -1, uniform_feats.shape[-1])
+            salient_pc = salient_pc.view(bs*N, -1)[salient_idx].view(bs, -1, salient_pc.shape[-1])
+            salient_feats = salient_feats.view(bs*N, -1)[salient_idx].view(bs, -1, salient_feats.shape[-1])
+
+        shape_latents = self.encoder(uniform_pc, salient_pc, uniform_feats, salient_feats) # uniform_pc: torch.Size([1, 16384, 3]). salient_pc: torch.Size([1, 16384, 3]). uniform_feats: torch.Size([1, 16384, 3]). salient_feats: torch.Size([1, 16384, 3])
+        kl_embed, posterior = self.encode_kl_embed(shape_latents, sample_posterior)
+        return shape_latents, kl_embed, posterior
 
     def decode(self, 
                latents: torch.FloatTensor):

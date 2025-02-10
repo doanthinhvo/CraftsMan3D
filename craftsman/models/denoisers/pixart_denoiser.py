@@ -81,14 +81,33 @@ class PixArtDinoDenoiser(BaseModule):
 
         self.identity_initialize()
 
-        if self.cfg.pretrained_model_name_or_path:
-            print(f"Loading pretrained model from {self.cfg.pretrained_model_name_or_path}")
-            ckpt = torch.load(self.cfg.pretrained_model_name_or_path, map_location="cpu")['state_dict']
-            self.denoiser_ckpt = {}
-            for k, v in ckpt.items():
-                if k.startswith('denoiser_model.'):
-                    self.denoiser_ckpt[k.replace('denoiser_model.', '')] = v
-            self.load_state_dict(self.denoiser_ckpt, strict=False)
+        # if self.cfg.pretrained_model_name_or_path:
+        #     print(f"Loading pretrained model from {self.cfg.pretrained_model_name_or_path}")
+        #     ckpt = torch.load(self.cfg.pretrained_model_name_or_path, map_location="cpu")['state_dict']
+        #     self.denoiser_ckpt = {}
+        #     for k, v in ckpt.items():
+        #         if k.startswith('denoiser_model.'):
+        #             self.denoiser_ckpt[k.replace('denoiser_model.', '')] = v
+        #     self.load_state_dict(self.denoiser_ckpt, strict=False)
+
+        # Load from general checkpoints.
+        if self.cfg.pretrained_model_name_or_path: 
+            print(f"Loading pretrained model from {self.cfg.pretrained_model_name_or_path} to pixart-denoiser")
+            pretrained_ckpt = torch.load(self.cfg.pretrained_model_name_or_path, map_location="cpu")
+            if 'state_dict' in pretrained_ckpt:
+                _pretrained_ckpt = {}
+                for k, v in pretrained_ckpt['state_dict'].items():
+                    if k.startswith('denoiser_model.'):
+                        _pretrained_ckpt[k.replace('denoiser_model.', '')] = v
+                pretrained_ckpt = _pretrained_ckpt
+            else: 
+                _pretrained_ckpt = {}
+                for k, v in pretrained_ckpt.items():
+                    if k.startswith('denoiser_model.'):
+                        _pretrained_ckpt[k.replace('denoiser_model.', '')] = v
+                pretrained_ckpt = _pretrained_ckpt
+
+            self.load_state_dict(pretrained_ckpt, strict=False)
 
     def identity_initialize(self):
         for block in self.blocks:

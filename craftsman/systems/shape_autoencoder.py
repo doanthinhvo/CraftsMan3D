@@ -28,6 +28,7 @@ class ShapeAutoEncoderSystem(BaseSystem):
         self.shape_model = craftsman.find(self.cfg.shape_model_type)(self.cfg.shape_model)
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        
         if "xyz" in batch:
             if "sdf" in batch:
                 bs = batch["sdf"].shape[0]
@@ -53,11 +54,18 @@ class ShapeAutoEncoderSystem(BaseSystem):
                 raise NotImplementedError
 
         # forward pass
-        _, latents, posterior, logits = self.shape_model(
-            batch["surface"][..., :3 + self.cfg.shape_model.point_feats], 
-            rand_points, 
-            sample_posterior=self.cfg.sample_posterior
-        )
+        if self.cfg.shape_model.encoder == "perceiver-dual-cross-attention-encoder":
+            _, latents, posterior, logits = self.shape_model(
+                batch["surface"][..., :12], 
+                rand_points, 
+                sample_posterior=self.cfg.sample_posterior
+            )
+        else:
+            _, latents, posterior, logits = self.shape_model(
+                batch["surface"][..., :3 + self.cfg.shape_model.point_feats], 
+                rand_points, 
+                sample_posterior=self.cfg.sample_posterior
+            )
 
         if self.cfg.sample_posterior:
             loss_kl = posterior.kl()

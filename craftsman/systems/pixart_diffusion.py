@@ -9,6 +9,7 @@ from skimage import measure
 from einops import repeat
 from tqdm import tqdm
 from PIL import Image
+import rembg
 
 from diffusers import (
     DDPMScheduler,
@@ -23,6 +24,72 @@ from craftsman.systems.base import BaseSystem
 from craftsman.utils.misc import get_rank
 from craftsman.utils.typing import *
 from diffusers import DDIMScheduler
+from craftsman.utils.config import ExperimentConfig, load_config
+
+def load_denoiser_model(cfg):
+    denoiser_model = craftsman.find(cfg.denoiser_model_type)(cfg.denoiser_model)
+    denoiser_model.eval()
+    denoiser_model.requires_grad_(False)
+    return denoiser_model
+
+def preprocess_image(
+    images_pil: List[Image.Image],
+    force: bool = False,
+    background_color: List[int] = [255, 255, 255],
+    foreground_ratio: float = 1.0,
+) -> List[Image.Image]:
+    """
+    Crop and remove the background of the input image
+    Args:
+        images_pil (`List[Image.Image]`):
+            List of `Image.Image` objects representing the input image.
+        force (`bool`, *optional*, defaults to `False`):
+            Whether to force remove the background even if the image has an alpha channel.
+        background_color (`List[int]`, *optional*, defaults to `[255, 255, 255]`):
+            RGB color values for the background.
+        foreground_ratio (`float`, *optional*, defaults to `1.0`):
+            Ratio to scale the foreground image.
+    Returns:
+        `List[Image.Image]`: List of preprocessed images.
+    """
+    preprocessed_images = []
+    for i in range(len(images_pil)):
+        image = images_pil[i]
+        do_remove = True
+        if image.mode == "RGBA" and image.getextrema()[3][0] < 255:
+            print("alpha channel not empty, skip remove background, using alpha channel as mask")
+            background = Image.new("RGBA", image.size, (*background_color, 0))
+            image = Image.alpha_composite(background, image)
+            do_remove = False
+        do_remove = do_remove or force
+        if do_remove:
+            image = rembg.remove(image)
+
+        # calculate the min bbox of the image
+        alpha = image.split()[-1]
+        image = image.crop(alpha.getbbox())
+
+        # Calculate the new size after rescaling
+        new_size = tuple(int(dim * foreground_ratio) for dim in image.size)
+        # Resize the image while maintaining the aspect ratio
+        resized_image = image.resize(new_size)
+        # Create a new image with the original size and white background
+        padded_image = Image.new("RGBA", image.size, (*background_color, 0))
+        paste_position = ((image.width - resized_image.width) // 2, (image.height - resized_image.height) // 2)
+        padded_image.paste(resized_image, paste_position)
+
+        # expand image to 1:1
+        width, height = padded_image.size
+        if width == height:
+            preprocessed_images.append(padded_image)
+            continue
+        new_size = (max(width, height), max(width, height))
+        new_image = Image.new("RGBA", new_size, (*background_color, 1))
+        paste_position = ((new_size[0] - width) // 2, (new_size[1] - height) // 2)
+        new_image.paste(padded_image, paste_position)
+        preprocessed_images.append(new_image)
+
+    return preprocessed_images
 
 def compute_snr(noise_scheduler, timesteps):
     """
@@ -159,6 +226,14 @@ class PixArtDiffusionSystem(BaseSystem):
         self.shape_model.eval()
         self.shape_model.requires_grad_(False)
 
+        # Copy cross_attn weights to initialize cross_attn2
+        if hasattr(self.shape_model.encoder, 'cross_attn') and hasattr(self.shape_model.encoder, 'cross_attn2'):
+            # Copy weights from cross_attn to cross_attn2
+            for name, param in self.shape_model.encoder.cross_attn.named_parameters():
+                target_name = name.replace('cross_attn', 'cross_attn2')
+                if hasattr(self.shape_model.encoder.cross_attn2, target_name):
+                    getattr(self.shape_model.encoder.cross_attn2, target_name).data.copy_(param.data)
+
         self.condition = craftsman.find(self.cfg.condition_model_type)(self.cfg.condition_model)
         
         self.denoiser_model = craftsman.find(self.cfg.denoiser_model_type)(self.cfg.denoiser_model)
@@ -166,6 +241,13 @@ class PixArtDiffusionSystem(BaseSystem):
         self.noise_scheduler = craftsman.find(self.cfg.noise_scheduler_type)(**self.cfg.noise_scheduler)
 
         self.denoise_scheduler = craftsman.find(self.cfg.denoise_scheduler_type)(**self.cfg.denoise_scheduler)
+        
+        # 
+        # ckpt = torch.load("ckpts/craftsman/model.ckpt", map_location=torch.device('cpu'))
+        # self.load_state_dict(
+        #     ckpt["state_dict"] if "state_dict" in ckpt else ckpt,
+        # )
+        # self = self.to(self.device)
 
     def forward(self, batch: Dict[str, Any], skip_noise=False) -> Dict[str, Any]:
         # 1. encode shape latents
